@@ -58,6 +58,15 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
+// Block-tile dimensions for the shared-memory WMMA kernel (Kernel 4).
+// A block computes a BM x BN tile of C, marching over K in BK-wide steps.
+#define BM 64   // rows of C per block
+#define BN 64   // cols of C per block
+#define BK 16   // K-chunk staged into shared memory each step (== WMMA_K)
+// 4 warps per block, laid out 2x2; each warp owns a 32x32 region = 2x2 frags.
+#define WARPS_M 2
+#define WARPS_N 2
+
 
 // =============================================================================
 // KERNEL 1 -- Naive GEMM: C = alpha * A * B + beta * C
@@ -202,6 +211,105 @@ __global__ void gemm_wmma(
         for (int i = 0; i < c_frag.num_elements; i++)
             c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
         wmma::store_matrix_sync(C + cRow * N + cCol, c_frag, N, wmma::mem_row_major);
+    }
+}
+
+
+// =============================================================================
+// KERNEL 4 -- Shared-memory Tensor-Core GEMM (WMMA + smem staging)
+// =============================================================================
+//
+// Kernel 3 was latency-bound: each warp loaded A/B straight from global memory
+// and immediately fed a dependent mma_sync, so the tensor cores spent almost all
+// their time STALLED waiting on loads (profiler: ~6% HMMA pipe, ~10% DRAM --
+// both idle = the machine is waiting, not working).
+//
+// This kernel fixes that with the three levers cuBLAS uses:
+//
+//   1. REUSE      -- the whole block cooperatively stages a BMxBK slab of A and
+//                    a BKxBN slab of B into shared memory ONCE per K-step. Every
+//                    fragment load then hits fast shared memory, and each staged
+//                    value is reused by many warps instead of being re-fetched.
+//
+//   2. ILP        -- each warp owns a 32x32 output region = a 2x2 grid of
+//                    accumulator fragments. That is 4 INDEPENDENT mma_sync ops
+//                    per K-step, so while one MMA waits on its operands another
+//                    can issue. A single accumulator (Kernel 3) had nothing to
+//                    overlap.
+//
+//   3. LESS TRAFFIC -- an A value staged into smem feeds both column-tiles a
+//                    warp owns (and a B value feeds both row-tiles), so operands
+//                    are loaded from shared memory, not re-read from DRAM.
+//
+// Layout: blockDim = 128 (4 warps). Warps form a 2x2 grid; warp (wr,wc) computes
+// rows [wr*32, wr*32+32) x cols [wc*32, wc*32+32) of the block's BMxBN tile.
+//
+// Assumes M, N, K are multiples of BM/BN/BK (true for 1024).
+//
+__global__ void gemm_wmma_smem(
+    const __half *A, const __half *B, float *C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    __shared__ __half As[BM][BK];   // 64x16 slab of A  (2 KB)
+    __shared__ __half Bs[BK][BN];   // 16x64 slab of B  (2 KB)
+
+    int blockRow = blockIdx.y;      // block's tile row in C (M direction)
+    int blockCol = blockIdx.x;      // block's tile col in C (N direction)
+
+    int warpId  = threadIdx.x / warpSize;   // 0..3
+    int warpRow = warpId / WARPS_N;          // 0..1  (within the 2x2 warp grid)
+    int warpCol = warpId % WARPS_N;          // 0..1
+
+    // Each warp accumulates a 2x2 grid of 16x16 fragments.
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[2][2];
+    for (int mi = 0; mi < 2; mi++)
+        for (int ni = 0; ni < 2; ni++)
+            wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+    // March over K, staging one BK-wide chunk per iteration.
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        // Cooperative load: 128 threads bring BM*BK (=1024) halves of A and
+        // BK*BN (=1024) halves of B into shared memory, 8 elements each.
+        for (int idx = threadIdx.x; idx < BM * BK; idx += blockDim.x) {
+            int i = idx / BK, j = idx % BK;
+            As[i][j] = A[(blockRow * BM + i) * K + (k0 + j)];
+        }
+        for (int idx = threadIdx.x; idx < BK * BN; idx += blockDim.x) {
+            int i = idx / BN, j = idx % BN;
+            Bs[i][j] = B[(k0 + i) * N + (blockCol * BN + j)];
+        }
+        __syncthreads();
+
+        // Load this warp's operand fragments from shared memory, then issue the
+        // 4 independent MMAs. a_frag[mi] is reused across both ni; likewise b.
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag[2];
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag[2];
+
+        for (int mi = 0; mi < 2; mi++)
+            wmma::load_matrix_sync(a_frag[mi], &As[warpRow * 32 + mi * 16][0], BK);
+        for (int ni = 0; ni < 2; ni++)
+            wmma::load_matrix_sync(b_frag[ni], &Bs[0][warpCol * 32 + ni * 16], BN);
+
+        for (int mi = 0; mi < 2; mi++)
+            for (int ni = 0; ni < 2; ni++)
+                wmma::mma_sync(acc[mi][ni], a_frag[mi], b_frag[ni], acc[mi][ni]);
+
+        __syncthreads();   // tiles are reused next iteration -- wait before overwrite
+    }
+
+    // Apply alpha/beta and write each fragment back: C = alpha*acc + beta*C_old.
+    for (int mi = 0; mi < 2; mi++) {
+        for (int ni = 0; ni < 2; ni++) {
+            int cRow = blockRow * BM + warpRow * 32 + mi * 16;
+            int cCol = blockCol * BN + warpCol * 32 + ni * 16;
+
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+            wmma::load_matrix_sync(c_frag, C + cRow * N + cCol, N, wmma::mem_row_major);
+            for (int i = 0; i < c_frag.num_elements; i++)
+                c_frag.x[i] = alpha * acc[mi][ni].x[i] + beta * c_frag.x[i];
+            wmma::store_matrix_sync(C + cRow * N + cCol, c_frag, N, wmma::mem_row_major);
+        }
     }
 }
 
@@ -369,6 +477,22 @@ int main() {
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaMemcpy(h_C, d_C, bytes_C, cudaMemcpyDeviceToHost));
     printf("WMMA (FP16): %7.3f ms  -->  %s  (relative tol)\n",
+           elapsed_ms(start, stop),
+           verify_rel(h_ref, h_C, M * N) ? "PASS" : "FAIL");
+
+    // --- Shared-memory Tensor-Core GEMM (WMMA + smem staging) ---
+    // 4 warps per block; each block computes a BMxBN tile of C.
+    dim3 smemBlock(WARPS_M * WARPS_N * 32);          // 128 threads = 4 warps
+    dim3 smemGrid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    CUDA_CHECK(cudaMemcpy(d_C, h_C0, bytes_C, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(start));
+    gemm_wmma_smem<<<smemGrid, smemBlock>>>(d_A_h, d_B_h, d_C, M, N, K, alpha, beta);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, bytes_C, cudaMemcpyDeviceToHost));
+    printf("WMMA+smem  : %7.3f ms  -->  %s  (relative tol)\n",
            elapsed_ms(start, stop),
            verify_rel(h_ref, h_C, M * N) ? "PASS" : "FAIL");
 

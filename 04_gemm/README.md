@@ -222,12 +222,54 @@ edges would need masked loads into a padded staging tile.
 
 ---
 
+---
+
+## Kernel 4 — Shared-Memory Tensor-Core GEMM (WMMA + staging)
+
+Profiling Kernel 3 on a T4 showed **both** pipes nearly idle — ~6% tensor-core
+(HMMA) activity and ~10% DRAM throughput. Neither compute- nor bandwidth-bound:
+the kernel is **latency-bound**. Each warp loads an A/B tile straight from global
+memory and immediately feeds a *dependent* `mma_sync`, so the tensor cores spend
+almost all their time stalled waiting on those loads.
+
+Kernel 4 applies the three levers a tuned GEMM uses to keep the cores fed:
+
+```
+1. REUSE         The whole block cooperatively stages a 64×16 slab of A and a
+                 16×64 slab of B into shared memory once per K-step. Fragment
+                 loads then hit fast shared memory, and each staged value is
+                 reused by many warps instead of being re-fetched from DRAM.
+
+2. ILP           Each warp owns a 32×32 output region = a 2×2 grid of accumulator
+                 fragments → 4 INDEPENDENT mma_sync ops per K-step. While one MMA
+                 waits on operands, another can issue. Kernel 3's single
+                 accumulator had nothing to overlap.
+
+3. LESS TRAFFIC  An A operand staged in shared memory feeds both column-tiles a
+                 warp owns (and a B operand feeds both row-tiles), cutting global
+                 reads further.
+```
+
+```
+Block: 128 threads = 4 warps, arranged 2×2.
+Tile : block computes a 64×64 tile of C; warp (wr,wc) owns its 32×32 quadrant.
+Smem : 2 KB (A slab) + 2 KB (B slab) = 4 KB per block.
+```
+
+The expected payoff is the **HMMA-pipe utilization climbing** from ~6% toward the
+tens-of-percent range as the stalls disappear — re-run the `ncu` command from the
+profiling notes on `gemm_wmma_smem` to watch it move. The remaining gap to cuBLAS
+is mostly double-buffering (prefetching the next K-slab while computing the
+current one) and larger warp tiles, which this kernel keeps simple on purpose.
+
+---
+
 ## Files in This Module
 
 ```
 04_gemm/
-    gemm.cu    Four kernels with timing and correctness check:
-               naive, tiled, WMMA (tensor core), cuBLAS
+    gemm.cu    Five kernels with timing and correctness check:
+               naive, tiled, WMMA (tensor core), WMMA+smem, cuBLAS
 ```
 
 ## Build & Run
