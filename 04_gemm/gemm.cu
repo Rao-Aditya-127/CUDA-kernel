@@ -32,7 +32,11 @@
 #include <cstdlib>
 #include <cmath>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 #include "../common/helper.cuh"
+
+using namespace nvcuda;
 
 #define CUBLAS_CHECK(call)                                                    \
     do {                                                                      \
@@ -46,6 +50,13 @@
 
 #define BLOCK_DIM 16
 #define TILE_SIZE 16
+
+// WMMA tensor-core tile shape. 16x16x16 with __half inputs + float accumulate is
+// the one fragment geometry supported on BOTH Turing (T4, sm_75) and Ada (L4, sm_89).
+// (TF32 16x16x8 would be cleaner for our float data but needs sm_80+, so T4 is out.)
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 
 // =============================================================================
@@ -131,6 +142,79 @@ __global__ void gemm_tiled(
 
 
 // =============================================================================
+// KERNEL 3 -- Tensor-Core GEMM (WMMA): C = alpha * A * B + beta * C
+// =============================================================================
+//
+// Tensor cores are dedicated matrix-multiply-accumulate units. One instruction
+// multiplies a 16x16x16 tile and accumulates it -- a whole tile per op instead
+// of one scalar FMA per thread. The catch: they only consume LOW-PRECISION
+// inputs. Here we use FP16 (__half) for A and B, but accumulate in FP32, which
+// keeps the running sum accurate even though the operands are half precision.
+//
+// The unit of work is a WARP, not a thread. All 32 lanes cooperate on one
+// 16x16 output tile via the opaque "fragment" types -- you never index
+// individual elements of A or B by hand; load_matrix_sync / mma_sync /
+// store_matrix_sync move whole tiles between memory, registers, and the cores.
+//
+// PRECISION NOTE: A and B are rounded to FP16 before multiplying, so the result
+// differs from the exact FP32 reference by ~0.1-1%. That is expected and is why
+// main() checks this kernel with a RELATIVE tolerance instead of the strict
+// absolute one used for the FP32 kernels.
+//
+// Assumes M, N, K are multiples of 16 (true for 1024). Handling ragged edges
+// would need masked loads into a padded shared-memory staging tile.
+//
+__global__ void gemm_wmma(
+    const __half *A, const __half *B, float *C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    // Map this warp to one 16x16 tile of C.
+    //   threadIdx.x spans several warps along the row (M) direction
+    //   threadIdx.y indexes the tile along the column (N) direction
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    // Slide a 16-wide tile across the K dimension, accumulating each product.
+    for (int k = 0; k < K; k += WMMA_K) {
+        int aRow = warpM * WMMA_M;   // top row of A's tile  (in M)
+        int bCol = warpN * WMMA_N;   // left col of B's tile (in N)
+
+        if (aRow < M && bCol < N) {
+            // A tile starts at (aRow, k), row stride K; B tile at (k, bCol), stride N.
+            wmma::load_matrix_sync(a_frag, A + aRow * K + k, K);
+            wmma::load_matrix_sync(b_frag, B + k * N + bCol, N);
+            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        }
+    }
+
+    // Apply alpha/beta and write back: C = alpha * acc + beta * C_old.
+    int cRow = warpM * WMMA_M;
+    int cCol = warpN * WMMA_N;
+    if (cRow < M && cCol < N) {
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+        wmma::load_matrix_sync(c_frag, C + cRow * N + cCol, N, wmma::mem_row_major);
+        for (int i = 0; i < c_frag.num_elements; i++)
+            c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
+        wmma::store_matrix_sync(C + cRow * N + cCol, c_frag, N, wmma::mem_row_major);
+    }
+}
+
+
+// Convert an FP32 buffer to FP16 on the device (one thread per element).
+// Tensor cores need half-precision operands; A and B are staged through this.
+__global__ void convert_f32_to_f16(const float *in, __half *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+
+
+// =============================================================================
 // CPU reference
 // =============================================================================
 void gemm_cpu(
@@ -162,6 +246,21 @@ bool verify(const float *ref, const float *result, int size, float tol = 1e-2f) 
         if (fabsf(ref[i] - result[i]) > tol) {
             printf("  MISMATCH at [%d]: ref=%.5f  got=%.5f\n",
                    i, ref[i], result[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Relative-tolerance check for the tensor-core kernel. FP16 operands make an
+// absolute 1e-2 bound unrealistic on values of magnitude ~500, so compare the
+// error against the reference's own size instead.
+bool verify_rel(const float *ref, const float *result, int size, float rtol = 2e-2f) {
+    for (int i = 0; i < size; i++) {
+        float denom = fabsf(ref[i]) > 1e-6f ? fabsf(ref[i]) : 1.0f;
+        if (fabsf(ref[i] - result[i]) / denom > rtol) {
+            printf("  MISMATCH at [%d]: ref=%.5f  got=%.5f  (rel=%.4f)\n",
+                   i, ref[i], result[i], fabsf(ref[i] - result[i]) / denom);
             return false;
         }
     }
@@ -244,6 +343,35 @@ int main() {
            elapsed_ms(start, stop),
            verify(h_ref, h_C, M * N) ? "PASS" : "FAIL");
 
+    // --- Tensor-Core GEMM (WMMA, FP16 inputs) ---
+    //
+    // Tensor cores need FP16 operands, so stage half-precision copies of A and B.
+    __half *d_A_h, *d_B_h;
+    CUDA_CHECK(cudaMalloc(&d_A_h, M * K * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_B_h, K * N * sizeof(__half)));
+
+    int convBlock = 256;
+    convert_f32_to_f16<<<(M * K + convBlock - 1) / convBlock, convBlock>>>(d_A, d_A_h, M * K);
+    convert_f32_to_f16<<<(K * N + convBlock - 1) / convBlock, convBlock>>>(d_B, d_B_h, K * N);
+    CUDA_CHECK(cudaGetLastError());
+
+    // One warp computes one 16x16 tile. Block = 128x4 threads = 4x4 = 16 warps,
+    // each warp owning a 16x16 tile, so a block covers a 64x64 region of C.
+    dim3 wmmaBlock(128, 4);
+    dim3 wmmaGrid((M + (WMMA_M * wmmaBlock.x / 32) - 1) / (WMMA_M * wmmaBlock.x / 32),
+                  (N + (WMMA_N * wmmaBlock.y) - 1) / (WMMA_N * wmmaBlock.y));
+
+    CUDA_CHECK(cudaMemcpy(d_C, h_C0, bytes_C, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(start));
+    gemm_wmma<<<wmmaGrid, wmmaBlock>>>(d_A_h, d_B_h, d_C, M, N, K, alpha, beta);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, bytes_C, cudaMemcpyDeviceToHost));
+    printf("WMMA (FP16): %7.3f ms  -->  %s  (relative tol)\n",
+           elapsed_ms(start, stop),
+           verify_rel(h_ref, h_C, M * N) ? "PASS" : "FAIL");
+
     // --- cuBLAS GEMM ---
     //
     // cublasSgemm expects column-major matrices, but ours are row-major.
@@ -301,6 +429,8 @@ int main() {
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_A_h));
+    CUDA_CHECK(cudaFree(d_B_h));
 
     return 0;
 }

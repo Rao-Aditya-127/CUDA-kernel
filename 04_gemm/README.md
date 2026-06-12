@@ -191,20 +191,58 @@ attention.
 
 ---
 
+## Kernel 3 — Tensor-Core GEMM (WMMA)
+
+Tensor cores are dedicated matrix-multiply-accumulate units that multiply a whole
+`16×16×16` tile per instruction instead of doing one scalar FMA per thread. The
+trade-off is precision: they only consume **low-precision inputs**. This kernel
+feeds them **FP16** copies of `A` and `B` while accumulating in **FP32**, so the
+running sum stays accurate even though the operands are half precision.
+
+```
+Unit of work:   a WARP (32 lanes), not a thread.
+Data type:      __half inputs, float accumulator.
+API:            wmma::load_matrix_sync / mma_sync / store_matrix_sync
+                operate on opaque "fragment" tiles — you never index A or B
+                element-by-element.
+```
+
+**Why FP16 (and not TF32)?** The target VM GPUs are the T4 (Turing, `sm_75`) and
+the L4 (Ada, `sm_89`). TF32 tensor cores only exist on `sm_80+`, so they would
+exclude the T4. The `16×16×16` FP16 fragment shape is the one geometry supported
+on **both**, so it is the portable choice.
+
+**Precision check:** because `A` and `B` are rounded to FP16, the result differs
+from the exact FP32 reference by ~0.1–1%. The strict absolute `1e-2` check used
+for the FP32 kernels would wrongly FAIL it, so this kernel is verified with a
+**relative tolerance** (`verify_rel`, 2%) instead.
+
+This kernel assumes `M`, `N`, `K` are multiples of 16 (true for 1024). Ragged
+edges would need masked loads into a padded staging tile.
+
+---
+
 ## Files in This Module
 
 ```
 04_gemm/
-    gemm.cu    Three kernels with timing and correctness check: naive, tiled, cuBLAS
+    gemm.cu    Four kernels with timing and correctness check:
+               naive, tiled, WMMA (tensor core), cuBLAS
 ```
 
 ## Build & Run
 
 ```bash
 cd 04_gemm
+# L4 (Ada):    -arch=sm_89
+# T4 (Turing): -arch=sm_75
 nvcc -O2 -arch=sm_89 -I.. gemm.cu -o gemm -lcublas
 ./gemm
 ```
+
+The WMMA path needs the `<mma.h>` / `<cuda_fp16.h>` headers (bundled with CUDA)
+and a real `-arch` that has tensor cores — `sm_75` or higher. Compiling for a
+pre-Turing arch will fail to find the WMMA intrinsics.
 
 ## What to Notice
 
